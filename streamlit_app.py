@@ -1,151 +1,165 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
+from io import BytesIO
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+st.set_page_config(page_title="RBM Worst 15 OSG Conversion Report", layout="wide")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+st.title("📊 RBM Wise Worst 15 Staff - OSG Conversion Report")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# File Uploads
+product_file = st.file_uploader("Upload PRODUCT File", type=["xlsx"])
+osg_file = st.file_uploader("Upload OSG File", type=["xlsx"])
+lg_file = st.file_uploader("Upload LG AMC File", type=["xlsx"])
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+if product_file and osg_file and lg_file:
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    # ==========================
+    # LOAD FILES
+    # ==========================
+    product = pd.read_excel(product_file)
+    osg = pd.read_excel(osg_file)
+    lg = pd.read_excel(lg_file)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    # ==========================
+    # REMOVE RETURNS FROM PRODUCT
+    # ==========================
+    product['Invoice Number'] = product['Invoice Number'].astype(str)
+    
+    # Identify return invoices (QTY -1)
+    returns = product[product['QTY'] == -1]
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+    # Remove both -1 and corresponding +1
+    for _, row in returns.iterrows():
+        invoice = row['Invoice Number']
+        imei = row['IMEI']
+        product = product[~(
+            (product['Invoice Number'] == invoice) &
+            (product['IMEI'] == imei)
+        )]
+
+    # Keep only positive sales
+    product = product[product['QTY'] > 0]
+
+    # ==========================
+    # PRODUCT COUNT PER STAFF
+    # ==========================
+    total_product = product.groupby(
+        ['RBM', 'Staff']
+    )['QTY'].sum().reset_index()
+
+    total_product.rename(columns={'QTY': 'Total_Product_Qty'}, inplace=True)
+
+    # ==========================
+    # OSG DATA
+    # ==========================
+    osg = osg[osg['QTY'] > 0]
+
+    osg_count = osg.groupby(
+        ['RBM', 'Staff']
+    )['QTY'].sum().reset_index()
+
+    osg_count.rename(columns={'QTY': 'OSG_Qty'}, inplace=True)
+
+    # Category wise OSG
+    category_wise = osg.groupby(
+        ['RBM', 'Staff', 'Item Category']
+    )['QTY'].sum().reset_index()
+
+    # ==========================
+    # LG AMC DATA
+    # ==========================
+    lg = lg[lg['QTY'] > 0]
+
+    lg_count = lg.groupby(
+        ['RBM', 'Staff']
+    )['QTY'].sum().reset_index()
+
+    lg_count.rename(columns={'QTY': 'LG_AMC_Qty'}, inplace=True)
+
+    # ==========================
+    # MERGE ALL
+    # ==========================
+    report = total_product.merge(osg_count, on=['RBM', 'Staff'], how='left')
+    report = report.merge(lg_count, on=['RBM', 'Staff'], how='left')
+
+    report.fillna(0, inplace=True)
+
+    # Conversion %
+    report['OSG_Conversion_%'] = (
+        report['OSG_Qty'] / report['Total_Product_Qty']
+    ) * 100
+
+    report['OSG_Conversion_%'] = report['OSG_Conversion_%'].round(2)
+
+    # ==========================
+    # DEFINE NEAR ZERO (<=2%)
+    # ==========================
+    report['Zero_or_Near'] = np.where(
+        report['OSG_Conversion_%'] <= 2,
+        "Yes",
+        "No"
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    # ==========================
+    # WORST 15 PER RBM
+    # ==========================
+    worst_list = []
 
-    return gdp_df
+    for rbm in report['RBM'].unique():
+        temp = report[
+            (report['RBM'] == rbm) &
+            (report['Zero_or_Near'] == "Yes")
+        ].sort_values(
+            by=['OSG_Qty', 'OSG_Conversion_%'],
+            ascending=[False, True]
+        ).head(15)
 
-gdp_df = get_gdp_data()
+        worst_list.append(temp)
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    final_report = pd.concat(worst_list)
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    # ==========================
+    # CATEGORY SUMMARY PIVOT
+    # ==========================
+    category_summary = category_wise.pivot_table(
+        index=['RBM', 'Staff'],
+        columns='Item Category',
+        values='QTY',
+        aggfunc='sum'
+    ).reset_index()
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+    category_summary.fillna(0, inplace=True)
 
-# Add some spacing
-''
-''
+    final_report = final_report.merge(
+        category_summary,
+        on=['RBM', 'Staff'],
+        how='left'
+    )
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+    final_report.fillna(0, inplace=True)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+    st.success("Report Generated Successfully")
 
-countries = gdp_df['Country Code'].unique()
+    st.dataframe(final_report)
 
-if not len(countries):
-    st.warning("Select at least one country")
+    # ==========================
+    # EXPORT TO EXCEL
+    # ==========================
+    def to_excel(df):
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Worst_15_Staff')
+        return output.getvalue()
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+    excel_data = to_excel(final_report)
 
-''
-''
-''
+    st.download_button(
+        label="📥 Download Excel Report",
+        data=excel_data,
+        file_name="RBM_Worst_15_OSG_Report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+else:
+    st.info("Please upload all three files to generate report.")

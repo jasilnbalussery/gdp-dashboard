@@ -15,90 +15,100 @@ lg_file = st.file_uploader("Upload LG AMC File", type=["xlsx"])
 if product_file and osg_file and lg_file:
 
     # ==========================
-    # LOAD FILES
+    # SAFE LOAD + STANDARDIZE
     # ==========================
-    product = pd.read_excel(product_file)
-    osg = pd.read_excel(osg_file)
-    lg = pd.read_excel(lg_file)
+    def load_file(file):
+        df = pd.read_excel(file, engine="openpyxl")
+        df.columns = df.columns.str.strip().str.upper()
+        return df
+
+    product = load_file(product_file)
+    osg = load_file(osg_file)
+    lg = load_file(lg_file)
 
     # ==========================
     # REMOVE RETURNS FROM PRODUCT
     # ==========================
-    product['Invoice Number'] = product['Invoice Number'].astype(str)
-    
-    # Identify return invoices (QTY -1)
-    returns = product[product['QTY'] == -1]
+    product['INVOICE NUMBER'] = product['INVOICE NUMBER'].astype(str)
+    product['QTY'] = pd.to_numeric(product['QTY'], errors='coerce').fillna(0)
 
-    # Remove both -1 and corresponding +1
-    for _, row in returns.iterrows():
-        invoice = row['Invoice Number']
-        imei = row['IMEI']
-        product = product[~(
-            (product['Invoice Number'] == invoice) &
-            (product['IMEI'] == imei)
-        )]
+    # Remove matching +1 and -1 using group logic
+    product = product.groupby(
+        ['INVOICE NUMBER', 'IMEI', 'RBM', 'STAFF'],
+        as_index=False
+    )['QTY'].sum()
 
-    # Keep only positive sales
+    # Keep only positive net sales
     product = product[product['QTY'] > 0]
 
     # ==========================
     # PRODUCT COUNT PER STAFF
     # ==========================
-    total_product = product.groupby(
-        ['RBM', 'Staff']
-    )['QTY'].sum().reset_index()
-
-    total_product.rename(columns={'QTY': 'Total_Product_Qty'}, inplace=True)
+    total_product = (
+        product.groupby(['RBM', 'STAFF'])['QTY']
+        .sum()
+        .reset_index(name='TOTAL_PRODUCT_QTY')
+    )
 
     # ==========================
-    # OSG DATA
+    # OSG DATA (Using EWS QTY)
     # ==========================
-    osg = osg[osg['QTY'] > 0]
+    if 'EWS QTY' not in osg.columns:
+        st.error("EWS QTY column not found in OSG file")
+        st.stop()
 
-    osg_count = osg.groupby(
-        ['RBM', 'Staff']
-    )['QTY'].sum().reset_index()
+    osg['EWS QTY'] = pd.to_numeric(osg['EWS QTY'], errors='coerce').fillna(0)
+    osg = osg[osg['EWS QTY'] > 0]
 
-    osg_count.rename(columns={'QTY': 'OSG_Qty'}, inplace=True)
+    osg_count = (
+        osg.groupby(['RBM', 'STAFF'])['EWS QTY']
+        .sum()
+        .reset_index(name='OSG_QTY')
+    )
 
     # Category wise OSG
-    category_wise = osg.groupby(
-        ['RBM', 'Staff', 'Item Category']
-    )['QTY'].sum().reset_index()
+    category_wise = (
+        osg.groupby(['RBM', 'STAFF', 'ITEM CATEGORY'])['EWS QTY']
+        .sum()
+        .reset_index()
+    )
 
     # ==========================
     # LG AMC DATA
     # ==========================
+    lg['QTY'] = pd.to_numeric(lg['QTY'], errors='coerce').fillna(0)
     lg = lg[lg['QTY'] > 0]
 
-    lg_count = lg.groupby(
-        ['RBM', 'Staff']
-    )['QTY'].sum().reset_index()
-
-    lg_count.rename(columns={'QTY': 'LG_AMC_Qty'}, inplace=True)
+    lg_count = (
+        lg.groupby(['RBM', 'STAFF'])['QTY']
+        .sum()
+        .reset_index(name='LG_AMC_QTY')
+    )
 
     # ==========================
     # MERGE ALL
     # ==========================
-    report = total_product.merge(osg_count, on=['RBM', 'Staff'], how='left')
-    report = report.merge(lg_count, on=['RBM', 'Staff'], how='left')
+    report = total_product.merge(osg_count, on=['RBM', 'STAFF'], how='left')
+    report = report.merge(lg_count, on=['RBM', 'STAFF'], how='left')
 
     report.fillna(0, inplace=True)
 
-    # Conversion %
-    report['OSG_Conversion_%'] = (
-        report['OSG_Qty'] / report['Total_Product_Qty']
+    # ==========================
+    # CONVERSION %
+    # ==========================
+    report['OSG_CONVERSION_%'] = (
+        report['OSG_QTY'] / report['TOTAL_PRODUCT_QTY']
     ) * 100
 
-    report['OSG_Conversion_%'] = report['OSG_Conversion_%'].round(2)
+    report['OSG_CONVERSION_%'] = report['OSG_CONVERSION_%'].round(2)
 
     # ==========================
     # DEFINE NEAR ZERO (<=2%)
     # ==========================
-    report['Zero_or_Near'] = np.where(
-        report['OSG_Conversion_%'] <= 2,
-        "Yes",
-        "No"
+    report['ZERO_OR_NEAR'] = np.where(
+        report['OSG_CONVERSION_%'] <= 2,
+        "YES",
+        "NO"
     )
 
     # ==========================
@@ -109,9 +119,9 @@ if product_file and osg_file and lg_file:
     for rbm in report['RBM'].unique():
         temp = report[
             (report['RBM'] == rbm) &
-            (report['Zero_or_Near'] == "Yes")
+            (report['ZERO_OR_NEAR'] == "YES")
         ].sort_values(
-            by=['OSG_Qty', 'OSG_Conversion_%'],
+            by=['OSG_QTY', 'OSG_CONVERSION_%'],
             ascending=[False, True]
         ).head(15)
 
@@ -123,9 +133,9 @@ if product_file and osg_file and lg_file:
     # CATEGORY SUMMARY PIVOT
     # ==========================
     category_summary = category_wise.pivot_table(
-        index=['RBM', 'Staff'],
-        columns='Item Category',
-        values='QTY',
+        index=['RBM', 'STAFF'],
+        columns='ITEM CATEGORY',
+        values='EWS QTY',
         aggfunc='sum'
     ).reset_index()
 
@@ -133,14 +143,13 @@ if product_file and osg_file and lg_file:
 
     final_report = final_report.merge(
         category_summary,
-        on=['RBM', 'Staff'],
+        on=['RBM', 'STAFF'],
         how='left'
     )
 
     final_report.fillna(0, inplace=True)
 
     st.success("Report Generated Successfully")
-
     st.dataframe(final_report)
 
     # ==========================
